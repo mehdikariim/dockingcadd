@@ -1,0 +1,324 @@
+# src/cadock.py
+
+import os
+import subprocess
+import sys
+import re
+import pandas as pd
+import numpy as np
+
+# RDKit
+from rdkit import Chem
+from rdkit.Chem import AllChem
+
+# BioPython
+from Bio.PDB import PDBList
+
+# OpenMM / PDBFixer
+from pdbfixer import PDBFixer
+from openmm.app import PDBFile
+
+########################################
+# 1) Some shared helper functions
+########################################
+
+def run_command_with_output(command, log_file):
+    """
+    Runs a command in a subprocess, capturing output to both console and a log file.
+    """
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    with open(log_file, 'w') as log:
+        for line in process.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+            sys.stdout.flush()
+    return process.wait()
+
+
+def keep_only_chain_A_with_fallback(input_pdb, output_pdb):
+    """
+    Extract chain A from `input_pdb`. If no lines found for chain A, fall back to full file.
+    Also remove any TER lines not referencing chain A, to avoid NoneType errors in PDBFixer.
+    """
+    chain_a_count = 0
+    with open(input_pdb, 'r') as infile, open(output_pdb, 'w') as outfile:
+        for line in infile:
+            chain_id = line[21] if len(line) >= 22 else None
+
+            if line.startswith(("ATOM", "HETATM")):
+                if chain_id == 'A':
+                    outfile.write(line)
+                    chain_a_count += 1
+            elif line.startswith("TER"):
+                # Keep if chain is 'A'
+                if chain_id == 'A':
+                    outfile.write(line)
+            elif line.startswith("END"):
+                # Keep end
+                outfile.write(line)
+
+    if chain_a_count == 0:
+        # Fallback: copy the entire input_pdb => output_pdb
+        print("[WARN] No chain A lines found. Using full PDB instead.")
+        with open(input_pdb, 'r') as inf, open(output_pdb, 'w') as outf:
+            outf.write(inf.read())
+
+
+def fix_with_pdbfixer(pdb_file, out_file):
+    """
+    Use PDBFixer to add missing residues/atoms/hydrogens at pH=7.
+    """
+    fixer = PDBFixer(filename=pdb_file)
+    # We do NOT call removeHeterogens() because we want to keep co-ligand if in chain A
+    fixer.findMissingResidues()
+    fixer.findMissingAtoms()
+    fixer.addMissingAtoms()
+    fixer.addMissingHydrogens(7.0)
+
+    with open(out_file, 'w') as f:
+        PDBFile.writeFile(fixer.topology, fixer.positions, f)
+
+
+########################################
+# 2) Receptor Preparation
+########################################
+
+def prepare_receptor(pdb_id, out_dir="docking_results"):
+    """
+    1) Download PDB
+    2) Extract chain A (fallback to full)
+    3) Use PDBFixer to repair
+    4) Return path to final "cleaned" receptor PDB
+    """
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    pdbl = PDBList()
+    raw_file = pdbl.retrieve_pdb_file(pdb_id, file_format='pdb', pdir=out_dir)
+    raw_pdb = os.path.join(out_dir, f"{pdb_id}_raw.pdb")
+    os.rename(raw_file, raw_pdb)
+
+    chainA_pdb = os.path.join(out_dir, f"{pdb_id}_chainA_tmp.pdb")
+    keep_only_chain_A_with_fallback(raw_pdb, chainA_pdb)
+
+    final_pdb = os.path.join(out_dir, f"{pdb_id}_prepared.pdb")
+    fix_with_pdbfixer(chainA_pdb, final_pdb)
+
+    return final_pdb
+
+
+def convert_pdb_to_pdbqt_receptor(input_pdb, output_pdbqt):
+    """
+    Convert receptor from PDB to PDBQT (via obabel) removing polar, etc.
+    """
+    subprocess.run([
+        'obabel', '-i', 'pdb', input_pdb,
+        '-o', 'pdbqt', '-O', output_pdbqt,
+        '-xr', '-xn', '-xp'
+    ], check=True)
+
+
+########################################
+# 3) p2rank logic
+########################################
+def run_p2rank_and_get_center(receptor_pdb, pdb_id):
+    """
+    Run p2rank on the receptor PDB to find top pocket center, return (x,y,z).
+    """
+    p2rank_exec = os.path.join(os.getcwd(), 'p2rank_2.4.2', 'prank')
+    if not os.path.isfile(p2rank_exec):
+        raise FileNotFoundError("p2rank 'prank' not found. Check your installation.")
+
+    # Make sure it's executable
+    if not os.access(p2rank_exec, os.X_OK):
+        os.chmod(p2rank_exec, 0o755)
+
+    cmd = [p2rank_exec, 'predict', '-f', receptor_pdb]
+    code = subprocess.run(cmd, check=False)
+    if code.returncode != 0:
+        raise RuntimeError("p2rank failed to run properly.")
+
+    predictions_csv = f'p2rank_2.4.2/test_output/predict_{pdb_id}_prepared/{pdb_id}_prepared.pdb_predictions.csv'
+    # Or carefully build that path; if your naming differs, adjust accordingly.
+    df = pd.read_csv(predictions_csv, skipinitialspace=True)
+    # Standardize column names:
+    df.columns = [c.strip().lower() for c in df.columns]
+
+    cx = float(df['center_x'].iloc[0])
+    cy = float(df['center_y'].iloc[0])
+    cz = float(df['center_z'].iloc[0])
+    return (cx, cy, cz)
+
+
+########################################
+# 4) Ligand Preparation (Multi-Conformers)
+########################################
+def generate_multiple_conformers(mol, num_confs=3):
+    """
+    Generate multiple 3D conformers (RDKit), optimize each with UFF or MMFF if possible.
+    """
+    mol = Chem.AddHs(mol)
+    cids = AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, randomSeed=42)
+    for cid in cids:
+        if AllChem.MMFFHasAllMoleculeParams(mol):
+            AllChem.MMFFOptimizeMolecule(mol, confId=cid, maxIters=200)
+        else:
+            AllChem.UFFOptimizeMolecule(mol, confId=cid, maxIters=200)
+    return mol
+
+
+def prepare_ligands(smiles_list, num_confs=3, out_dir="docking_results/ligands"):
+    """
+    For each SMILES:
+     1) Generate multiple conformers
+     2) Write each conformer to a separate PDB
+     3) Return list of (pdb_path, label)
+    """
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+
+    results = []
+    for idx, smi in enumerate(smiles_list):
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            print(f"[WARN] Invalid SMILES: {smi}")
+            continue
+        mol3d = generate_multiple_conformers(mol, num_confs=num_confs)
+
+        # write each conformer
+        for i, conf in enumerate(mol3d.GetConformers(), start=1):
+            conf_mol = Chem.Mol(mol3d, False, conf.GetId())
+            pdb_path = os.path.join(out_dir, f"lig_{idx+1}_conf{i}.pdb")
+            Chem.MolToPDBFile(conf_mol, pdb_path)
+            label = os.path.splitext(os.path.basename(pdb_path))[0]
+            results.append((pdb_path, label))
+    return results
+
+
+def convert_pdb_to_pdbqt_ligand(input_pdb, output_pdbqt):
+    """
+    Convert a ligand PDB to PDBQT using obabel, adding hydrogens if needed.
+    """
+    subprocess.run([
+        'obabel', '-i', 'pdb', input_pdb,
+        '-o', 'pdbqt', '-O', output_pdbqt,
+        '-h'
+    ], check=True)
+
+
+########################################
+# 5) Docking
+########################################
+def perform_docking(
+    smiles_list=None,  # list of SMILES strings
+    pdb_id="1XYZ",     # default PDB ID
+    num_confs=3,
+    docking_folder="docking_results"
+):
+    """
+    1) Prepare receptor (chain A + PDBFixer).
+    2) run p2rank -> get top pocket center => (cx, cy, cz), 20A box
+    3) Receptor -> PDBQT
+    4) Prepare ligands (multi-conformers) -> each conf => PDB
+    5) For each conf => PDBQT => Vina => parse best => final complex
+    6) Log scores in docking_results.txt or .csv
+    """
+
+    if not smiles_list:
+        print("[ERROR] No SMILES provided.")
+        return
+
+    if not os.path.exists(docking_folder):
+        os.makedirs(docking_folder, exist_ok=True)
+
+    print(f"Preparing receptor {pdb_id}...")
+    receptor_pdb = prepare_receptor(pdb_id, docking_folder)
+    # p2rank
+    center_x, center_y, center_z = run_p2rank_and_get_center(receptor_pdb, f"{pdb_id}")
+    print(f"Top pocket center: {center_x}, {center_y}, {center_z} (using 20x20x20 box)")
+
+    # receptor -> pdbqt
+    receptor_pdbqt = os.path.join(docking_folder, f"{pdb_id}_prepared.pdbqt")
+    convert_pdb_to_pdbqt_receptor(receptor_pdb, receptor_pdbqt)
+
+    # prep ligands
+    ligands = prepare_ligands(smiles_list, num_confs=num_confs, out_dir=os.path.join(docking_folder,"ligs"))
+    if len(ligands) == 0:
+        print("No valid ligands to dock.")
+        return
+
+    # do docking
+    results_file = os.path.join(docking_folder, "docking_results.csv")
+    with open(results_file, 'w') as rf:
+        rf.write("LigandLabel,Score\n")
+
+        for i, (pdb_file, label) in enumerate(ligands):
+            print(f"\nDocking {label}...")
+
+            ligand_pdbqt = os.path.join(docking_folder, f"{label}.pdbqt")
+            convert_pdb_to_pdbqt_ligand(pdb_file, ligand_pdbqt)
+
+            out_pdbqt = os.path.join(docking_folder, f"{label}_out.pdbqt")
+            log_file = os.path.join(docking_folder, f"{label}_vina.log")
+
+            vina_cmd = [
+                'vina',    # or /usr/local/bin/vina if that's your installed path
+                '--receptor', receptor_pdbqt,
+                '--ligand', ligand_pdbqt,
+                '--out', out_pdbqt,
+                '--center_x', str(center_x),
+                '--center_y', str(center_y),
+                '--center_z', str(center_z),
+                '--size_x', '20',
+                '--size_y', '20',
+                '--size_z', '20',
+                '--num_modes', '1'
+            ]
+            exit_code = run_command_with_output(vina_cmd, log_file)
+
+            best_score = "N/A"
+            if exit_code == 0:
+                # parse log for best score
+                with open(log_file, 'r') as lf:
+                    for line in lf:
+                        if re.match(r'^\s*1\s+', line):
+                            parts = line.split()
+                            if len(parts) >= 2:
+                                best_score = parts[1]
+                            break
+            else:
+                print(f"[ERROR] Vina docking failed for {label}")
+                best_score = "ERROR"
+
+            print(f"[Docking] Best score for {label}: {best_score}")
+            rf.write(f"{label},{best_score}\n")
+
+            # Convert best pose from .pdbqt -> .pdb
+            docked_pdb = os.path.join(docking_folder, f"{label}_docked.pdb")
+            subprocess.run([
+                'obabel',
+                '-ipdbqt', out_pdbqt,
+                '-opdb',
+                '-O', docked_pdb,
+                '-d'
+            ], check=True)
+
+            # Merge with receptor -> final complex
+            final_complex = os.path.join(docking_folder, f"{label}_complex.pdb")
+            with open(final_complex, 'w') as outf:
+                # Write receptor lines
+                with open(receptor_pdb, 'r') as rf2:
+                    for line in rf2:
+                        if line.startswith("END"):
+                            continue
+                        outf.write(line)
+                outf.write("TER\n")
+                # Docked ligand
+                with open(docked_pdb, 'r') as df2:
+                    for line in df2:
+                        outf.write(line)
+                outf.write("END\n")
+
+            print(f"[Docking] Final complex saved as: {final_complex}")
+
+    print(f"\nDocking complete. See {results_file} for summary.")
