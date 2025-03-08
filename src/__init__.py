@@ -1,1 +1,1 @@
-from .dockingcadd import perform_docking
+from src.dockingcadd import perform_docking
