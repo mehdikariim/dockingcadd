@@ -1,103 +1,44 @@
-###########################
+##############################
 # dockcadd.py
-###########################
+##############################
 import streamlit as st
-import subprocess
 import os
-import sys
 import re
-import shutil
-import py3Dmol
-import zipfile
-from io import BytesIO
-
-# --- Try to install or confirm needed packages and binaries ---
-def install_dependencies():
-    """
-    Attempt to install everything needed for the docking pipeline:
-      - System packages (pymol, openbabel)
-      - Python packages (rdkit-pypi, pdbfixer, biopython, etc.)
-      - Autodock Vina 1.2.5
-      - p2rank 2.4.2
-    WARNING:
-      This will likely fail on Streamlit Cloud or other restricted environments.
-      Intended for local usage or Docker-based usage.
-    """
-    st.write("Attempting to install required system dependencies and Python libraries ...")
-    st.write("This may take several minutes. Please watch the logs for any errors.")
-
-    # 1) Install Python packages via pip
-    # You could list them all in one command or separate them
-    py_pkgs = [
-        "rdkit-pypi", "biopython", "pdbfixer", "py3Dmol", "pandas", "requests",
-        "openmm",  # optional for PDBFixer
-    ]
-    cmd_pip = [sys.executable, "-m", "pip", "install", "--quiet", "--upgrade"] + py_pkgs
-    try:
-        subprocess.run(cmd_pip, check=True)
-        st.write("Python libraries installed successfully.")
-    except subprocess.CalledProcessError as e:
-        st.error(f"Failed to install Python packages. Error: {e}")
-        return False
-
-    # 2) System-level installations (apt-get)
-    # Note that Streamlit Cloud typically won't allow this. 
-    apt_packages = ["pymol", "openbabel"]
-    try:
-        subprocess.run(["sudo", "apt-get", "update"], check=True)
-        subprocess.run(["sudo", "apt-get", "install", "-y"] + apt_packages, check=True)
-        st.write("System packages installed successfully.")
-    except Exception as e:
-        st.warning(f"System install step failed or not permitted. {e}")
-
-    # 3) AutoDock Vina 1.2.5
-    # We'll attempt to download the binary if it's not present
-    vina_bin = "vina_1.2.5_linux_x86_64"
-    if not os.path.exists(vina_bin):
-        st.write("Downloading AutoDock Vina 1.2.5...")
-        vina_url = "https://github.com/ccsb-scripps/AutoDock-Vina/releases/download/v1.2.5/vina_1.2.5_linux_x86_64"
-        try:
-            subprocess.run(["wget", "-q", vina_url, "-O", vina_bin], check=True)
-            subprocess.run(["chmod", "+x", vina_bin], check=True)
-            st.write("AutoDock Vina downloaded and made executable.")
-        except Exception as e:
-            st.error(f"Unable to download/install Vina. {e}")
-            return False
-    else:
-        st.write("AutoDock Vina 1.2.5 binary already present.")
-
-    # 4) p2rank 2.4.2
-    # We'll attempt to download and extract if it's not present
-    p2rank_dir = "p2rank_2.4.2"
-    if not os.path.exists(p2rank_dir):
-        st.write("Downloading p2rank 2.4.2 ...")
-        p2rank_url = "https://github.com/rdk/p2rank/releases/download/2.4.2/p2rank_2.4.2.tar.gz"
-        tar_file = "p2rank_2.4.2.tar.gz"
-        try:
-            subprocess.run(["wget", "-q", p2rank_url, "-O", tar_file], check=True)
-            subprocess.run(["tar", "-xzf", tar_file], check=True)
-            st.write("p2rank successfully downloaded and extracted.")
-        except Exception as e:
-            st.error(f"Failed to download or extract p2rank. {e}")
-            return False
-    else:
-        st.write("p2rank 2.4.2 folder already present.")
-
-    return True
-
-# --- Docking pipeline code below ---
+import sys
 import pandas as pd
-import numpy as np
+import subprocess
+from io import BytesIO
+import zipfile
 
-# RDKit
-from rdkit import Chem
-from rdkit.Chem import AllChem
+# Attempt to ensure py3Dmol is installed (only works if environment allows pip install at runtime)
+try:
+    import py3Dmol
+except ImportError:
+    st.warning("Installing py3Dmol library...")
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "py3Dmol"])
+    import py3Dmol
 
-# BioPython, PDBFixer
-from Bio.PDB import PDBList
-from pdbfixer import PDBFixer
-from openmm.app import PDBFile
+# RDKit is also required. If not installed, it won't work. Attempt to install if missing.
+try:
+    from rdkit import Chem
+    from rdkit.Chem import AllChem
+except ImportError:
+    st.error("RDKit not installed. Please install RDKit in your environment.")
+    st.stop()
 
+# PDBFixer, Biopython (for PDBList), etc.
+try:
+    from pdbfixer import PDBFixer
+    from openmm.app import PDBFile
+    from Bio.PDB import PDBList
+except ImportError:
+    st.error("pdbfixer and/or biopython are not installed. Please install them in your environment.")
+    st.stop()
+
+
+##############################
+# Helper Functions
+##############################
 
 def run_command_with_live_output(command, log_file):
     """
@@ -112,7 +53,7 @@ def run_command_with_live_output(command, log_file):
     )
     with open(log_file, 'w') as log:
         for line in process.stdout:
-            # If you want to see real-time logs in the Streamlit UI, you could do:
+            # If you want logs in real-time on Streamlit, you could do:
             # st.write(line)
             log.write(line)
     return process.wait()
@@ -120,10 +61,9 @@ def run_command_with_live_output(command, log_file):
 
 def keep_only_chain_A_with_fallback(pdb_id, out_dir="receptor_prep"):
     """
-    1) Download PDB
-    2) Attempt to extract chain A
-    3) Fallback to entire PDB if chain A not present
-    4) Repair with PDBFixer
+    1) Download the specified PDB.
+    2) Attempt to extract chain A lines. If none found, fallback to entire PDB.
+    3) Repair with PDBFixer and return final receptor path.
     """
     if not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
@@ -142,6 +82,7 @@ def keep_only_chain_A_with_fallback(pdb_id, out_dir="receptor_prep"):
             if len(line) < 22:
                 continue
             chain_id = line[21]
+
             if line.startswith(("ATOM", "HETATM")) and chain_id == 'A':
                 outfile.write(line)
                 chain_a_count += 1
@@ -170,6 +111,7 @@ def keep_only_chain_A_with_fallback(pdb_id, out_dir="receptor_prep"):
 def run_p2rank_and_get_center(pdb_file, pdb_id):
     """
     Run p2rank to predict pockets. Parse top pocket center (x, y, z).
+    p2rank must be installed or accessible in p2rank_2.4.2/
     """
     cmd = ["p2rank_2.4.2/prank", "predict", "-f", pdb_file]
     log_file = f"p2rank_{pdb_id}.log"
@@ -189,6 +131,9 @@ def run_p2rank_and_get_center(pdb_file, pdb_id):
 
 
 def convert_pdb_to_pdbqt_receptor(pdb_file, pdbqt_file):
+    """
+    Convert receptor PDB -> PDBQT using OpenBabel with flags for receptor
+    """
     cmd = [
         "obabel",
         "-i", "pdb", pdb_file,
@@ -200,6 +145,7 @@ def convert_pdb_to_pdbqt_receptor(pdb_file, pdbqt_file):
 
 
 def generate_multiple_conformers(mol, num_confs=3, minimize=True, useMMFF=True):
+    """Generate multiple 3D conformers for an RDKit Mol."""
     mol = Chem.AddHs(mol)
     cids = AllChem.EmbedMultipleConfs(mol, numConfs=num_confs, randomSeed=42)
     if minimize:
@@ -212,6 +158,10 @@ def generate_multiple_conformers(mol, num_confs=3, minimize=True, useMMFF=True):
 
 
 def prepare_ligands(smiles_list=None, sdf_file=None, num_confs=3, out_dir="ligand_prep"):
+    """
+    Create PDB files for each conformer from either SMILES or an SDF.
+    Return list of (pdb_path, label).
+    """
     if not os.path.exists(out_dir):
         os.makedirs(out_dir, exist_ok=True)
     
@@ -232,6 +182,7 @@ def prepare_ligands(smiles_list=None, sdf_file=None, num_confs=3, out_dir="ligan
         for idx, smi in enumerate(smiles_list):
             mol = Chem.MolFromSmiles(smi)
             if mol is None:
+                st.warning(f"Skipping invalid SMILES: {smi}")
                 continue
             mol3d = generate_multiple_conformers(mol, num_confs=num_confs)
             base_name = f"lig_{idx+1}"
@@ -242,6 +193,7 @@ def prepare_ligands(smiles_list=None, sdf_file=None, num_confs=3, out_dir="ligan
 
     # Option B: SDF
     if sdf_file and os.path.isfile(sdf_file):
+        from rdkit import Chem
         suppl = Chem.SDMolSupplier(sdf_file, removeHs=False)
         mol_count = 0
         for i, mol in enumerate(suppl):
@@ -260,6 +212,9 @@ def prepare_ligands(smiles_list=None, sdf_file=None, num_confs=3, out_dir="ligan
 
 
 def convert_pdb_to_pdbqt_ligand(input_pdb, output_pdbqt):
+    """
+    Convert ligand PDB -> PDBQT with OpenBabel
+    """
     cmd = [
         "obabel",
         "-i", "pdb", input_pdb,
@@ -278,24 +233,29 @@ def perform_docking(
     docking_folder="docking_results"
 ):
     """
-    Main docking workflow:
-      1) Prepare receptor (chain A or fallback).
-      2) p2rank -> get best pocket center.
-      3) Receptor to PDBQT.
-      4) Prepare ligands -> PDBQT.
-      5) Run Vina, parse best scores, write final complexes.
-    Returns path to CSV with results.
+    Master function that:
+    1) Preps the receptor (keeps chain A, fallback if missing).
+    2) Runs p2rank for binding site center.
+    3) Converts receptor to PDBQT.
+    4) Preps ligands -> PDB -> PDBQT.
+    5) Runs vina docking for each ligand conformer.
+    6) Merges final complexes and writes CSV of scores.
+    Returns path to results CSV.
     """
     if not os.path.exists(docking_folder):
         os.makedirs(docking_folder, exist_ok=True)
 
+    # 1) Receptor prep
     receptor_clean = keep_only_chain_A_with_fallback(pdb_id, out_dir=docking_folder)
+
+    # 2) p2rank -> get center
     center_x, center_y, center_z = run_p2rank_and_get_center(receptor_clean, pdb_id)
-    box_size = 20.0
+    box_size = 20.0  # you can make this adjustable if you want
 
     receptor_pdbqt = os.path.join(docking_folder, f"{pdb_id}_chainA_prepared.pdbqt")
     convert_pdb_to_pdbqt_receptor(receptor_clean, receptor_pdbqt)
 
+    # 3) Ligand prep
     ligands_folder = os.path.join(docking_folder, "ligands")
     prepared_ligands = prepare_ligands(
         smiles_list=smiles_list,
@@ -308,9 +268,7 @@ def perform_docking(
     with open(results_csv, 'w') as f:
         f.write("LigandFile,BestScore\n")
 
-    # Path to vina binary (assuming it's in the current directory)
-    vina_bin = os.path.join(".", "vina_1.2.5_linux_x86_64")
-
+    # 4) Dock each conformer
     for (pdb_path, label) in prepared_ligands:
         ligand_pdbqt = os.path.join(docking_folder, f"{label}.pdbqt")
         convert_pdb_to_pdbqt_ligand(pdb_path, ligand_pdbqt)
@@ -318,8 +276,10 @@ def perform_docking(
         out_pdbqt = os.path.join(docking_folder, f"{label}_out.pdbqt")
         log_file = os.path.join(docking_folder, f"{label}_vina.log")
 
+        # Attempt to call vina. You must have vina_1.2.5_linux_x86_64 in PATH or local folder
+        vina_executable = "./vina_1.2.5_linux_x86_64"  # or "vina_1.2.5_linux_x86_64"
         vina_cmd = [
-            vina_bin,
+            vina_executable,
             "--receptor", receptor_pdbqt,
             "--ligand", ligand_pdbqt,
             "--out", out_pdbqt,
@@ -331,20 +291,22 @@ def perform_docking(
             "--size_z", str(box_size),
             "--num_modes", "5"
         ]
+
         exit_code = run_command_with_live_output(vina_cmd, log_file)
         best_score = "N/A"
 
         if exit_code == 0:
+            # Parse best score from log
             with open(log_file, 'r') as lf:
                 for line in lf:
-                    # Look for line that starts with rank=1
+                    # For rank=1 line which typically starts with '   1    ...'
                     if re.match(r'^\s*1\s+', line):
                         parts = line.split()
                         if len(parts) >= 2:
                             best_score = parts[1]
                         break
 
-            # Convert best pose to PDB
+            # Convert best pose -> PDB
             docked_ligand_pdb = os.path.join(docking_folder, f"{label}_docked.pdb")
             obabel_cmd = [
                 "obabel",
@@ -374,121 +336,112 @@ def perform_docking(
     return results_csv
 
 
-# =============== Streamlit UI ===============
+##############################
+# Streamlit App
+##############################
 
 def main():
-    st.title("DockCADD: Docking Workflow with p2rank & AutoDock Vina")
-
-    # Attempt to install everything on script startup
-    # (not typical for Streamlit Cloud, but okay for local usage).
-    if "installed" not in st.session_state:
-        st.session_state["installed"] = False
-    if not st.session_state["installed"]:
-        with st.spinner("Installing dependencies..."):
-            success = install_dependencies()
-        st.session_state["installed"] = success
-        if not success:
-            st.warning("Some installations failed. You may need to run this locally or in Docker.")
-        else:
-            st.success("All dependencies are (hopefully) installed!")
-        st.stop()
-
+    st.title("DockingCADD - Docking with p2rank & Vina")
     st.markdown(
         """
-        **Instructions**:
-        1. Provide a PDB ID (e.g. `5ZMA`).
-        2. Provide ligands as SMILES (one per line) or upload an SDF.
-        3. Choose # of conformers per ligand.
-        4. Click **Run Docking**.
-        
-        **Note**: This app attempts to install everything at runtime, but typically
-        you must run it in a local or Docker environment that allows system package installation.
+        **IMPORTANT**  
+        This app requires external dependencies that may **not** be available on Streamlit Cloud:
+        - AutoDock Vina 1.2.5  
+        - Open Babel  
+        - p2rank 2.4.2  
+        - RDKit, pdbfixer, biopython, py3Dmol, etc.  
+
+        If running on your own machine (or Docker container) where these are installed, the app should work.  
+        On Streamlit Cloud, it will likely fail due to missing system-level installations.
         """
     )
 
-    pdb_id_input = st.text_input("Enter PDB ID", value="5ZMA")
+    pdb_id_input = st.text_input("Enter PDB ID:", value="5ZMA")
 
-    st.write("### Ligand Input")
-    input_mode = st.radio("Select Input Mode:", ["SMILES", "SDF"])
+    st.subheader("Ligand Input")
+    input_mode = st.radio("Select input mode:", ["SMILES", "SDF"])
 
     smiles_list = []
-    sdf_file_path = None
+    sdf_file = None
 
     if input_mode == "SMILES":
         smi_text = st.text_area("Enter one SMILES per line:")
         if smi_text.strip():
             smiles_list = [x.strip() for x in smi_text.splitlines() if x.strip()]
     else:
-        # SDF file
-        sdf_upload = st.file_uploader("Upload SDF file", type=["sdf"])
-        if sdf_upload is not None:
-            sdf_file_path = "uploaded_ligands.sdf"
-            with open(sdf_file_path, "wb") as f:
-                f.write(sdf_upload.getvalue())
+        sdf_file_upload = st.file_uploader("Upload SDF file:", type=["sdf"])
+        if sdf_file_upload is not None:
+            sdf_file = "uploaded_ligands.sdf"
+            with open(sdf_file, "wb") as f:
+                f.write(sdf_file_upload.getvalue())
 
-    num_confs = st.number_input("Number of conformers per ligand", min_value=1, max_value=20, value=3)
+    num_confs = st.number_input("Number of conformers per ligand:", min_value=1, max_value=20, value=3)
 
     if st.button("Run Docking"):
-        if not pdb_id_input.strip():
-            st.error("Please provide a PDB ID.")
-            st.stop()
+        if (not smiles_list) and (not sdf_file):
+            st.error("Please provide SMILES or an SDF file.")
+            return
 
-        with st.spinner("Running docking workflow..."):
-            results_csv_path = perform_docking(
-                smiles_list=smiles_list if input_mode == "SMILES" else None,
-                sdf_file=sdf_file_path if input_mode == "SDF" else None,
-                pdb_id=pdb_id_input.strip(),
-                num_confs=num_confs,
-                docking_folder="docking_results"
-            )
+        with st.spinner("Running docking..."):
+            try:
+                results_csv = perform_docking(
+                    smiles_list=smiles_list,
+                    sdf_file=sdf_file,
+                    pdb_id=pdb_id_input,
+                    num_confs=num_confs,
+                    docking_folder="docking_results"
+                )
+                st.success("Docking complete!")
+            except Exception as e:
+                st.error(f"Docking failed: {e}")
+                st.stop()
 
-        st.success("Docking complete!")
-        
-        # Display results
-        if os.path.exists(results_csv_path):
-            df = pd.read_csv(results_csv_path)
-            # Convert BestScore to numeric if possible
-            df["BestScore"] = pd.to_numeric(df["BestScore"], errors='coerce')
+        # Show results
+        if os.path.exists(results_csv):
+            df = pd.read_csv(results_csv)
+            df['BestScore'] = pd.to_numeric(df['BestScore'], errors='coerce')
+            st.write("## Docking Results")
             st.dataframe(df)
 
-            df_sorted = df.dropna(subset=["BestScore"]).sort_values(by="BestScore")
+            # Show top complex
+            df_sorted = df.dropna(subset=['BestScore']).sort_values(by='BestScore')
             if len(df_sorted) > 0:
-                top_ligand = df_sorted.iloc[0]["LigandFile"]
-                top_score = df_sorted.iloc[0]["BestScore"]
-                st.write(f"**Best Docking Pose**: {top_ligand} with score {top_score} kcal/mol")
+                top_ligand = df_sorted.iloc[0]['LigandFile']
+                top_score = df_sorted.iloc[0]['BestScore']
+                st.write(f"**Best Docking Pose:** {top_ligand} with score {top_score}")
 
-                # Show 3D with py3Dmol
                 top_complex_pdb = os.path.join("docking_results", f"{top_ligand}_complex.pdb")
                 if os.path.exists(top_complex_pdb):
-                    st.subheader("Top Complex Visualization (py3Dmol)")
+                    st.write("### 3D Visualization of Top Pose")
                     with open(top_complex_pdb, 'r') as f:
                         pdb_str = f.read()
 
                     viewer = py3Dmol.view(width=600, height=400)
                     viewer.addModel(pdb_str, 'pdb')
-                    # Receptor as cartoon
-                    viewer.setStyle({'chain': 'A'}, {"cartoon": {}})
-                    # Ligand as stick
-                    viewer.setStyle({'model': -1}, {"stick": {}})
+                    # Show receptor as cartoon
+                    viewer.setStyle({'cartoon': {}})
+                    # Show the ligand(s) as sticks
+                    viewer.setStyle({'model': -1}, {'stick': {}})
                     viewer.zoomTo()
                     viewer.spin(False)
                     st.write(viewer.render(), unsafe_allow_html=True)
 
-        # Let user download a ZIP of results
-        st.subheader("Download All Results")
-        zip_buffer = BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w") as zf:
-            for root, dirs, files in os.walk("docking_results"):
-                for file in files:
-                    fp = os.path.join(root, file)
-                    zf.write(fp, arcname=os.path.relpath(fp, "docking_results"))
+            # ZIP download
+            st.write("### Download All Results")
+            zip_buffer = BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w") as zf:
+                for root, dirs, files in os.walk("docking_results"):
+                    for file in files:
+                        filepath = os.path.join(root, file)
+                        arcname = os.path.relpath(filepath, "docking_results")
+                        zf.write(filepath, arcname)
 
-        st.download_button(
-            label="Download docking_results.zip",
-            data=zip_buffer.getvalue(),
-            file_name="docking_results.zip",
-            mime="application/zip"
-        )
+            st.download_button(
+                label="Download docking_results.zip",
+                data=zip_buffer.getvalue(),
+                file_name="docking_results.zip",
+                mime="application/zip"
+            )
 
 
 if __name__ == "__main__":
